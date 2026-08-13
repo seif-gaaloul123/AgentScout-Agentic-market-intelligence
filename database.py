@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 DATABASE_URL=os.getenv("DATABASE_URL")
+if os.path.exists("/.dockerenv") and DATABASE_URL and "localhost" in DATABASE_URL:
+    DATABASE_URL = DATABASE_URL.replace("localhost", "host.docker.internal")
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

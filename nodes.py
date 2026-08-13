@@ -1,100 +1,143 @@
-from tools import web_search,page_scraping,sentiment_analyser,competitors_extraction ,heavy_model,light_model
+from tools import web_search,page_scraping,sentiment_analyser,competitors_extraction ,heavy_model,light_model,better_query
 from state import AgentState
 import json , time
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-state = AgentState()
 def search_node(state):
+    new_query = better_query(state.query)
     reasoning = "[Action]Looking for search results"
-    webresults = web_search(state.query)
+    webresults = web_search(new_query)
     reasoning += "[Action]Extracting Competitors"
-    content = "\n".join(page_scraping(webresults))
-    competitors = competitors_extraction(content[:2000],state.query) #increase it later
+    page_content,scraped_ratio = page_scraping(webresults)
+    content = "\n".join(page_content)
+    competitors = competitors_extraction(content[:2000],new_query) #increase it later
     reasoning += "[Observation]Competitors extracted Successfully"
+    url_content = []
+    for extracted_url in webresults:
+        url_content.append(extracted_url['url'])
+    has_data = bool(content) or bool(competitors) #so we dont have to pass to all other nodes if we have no data
     return {
         "competitors": competitors,
         "reasoning": reasoning,
-        "results": webresults
+        "results": webresults,
+        "query": new_query,
+        "source" :url_content,
+        "has_data":has_data,
+        "scraped_ratio" : scraped_ratio
     }
 
+def data_check_router(state):
+    if not state.has_data and state.scraped_ratio == 0:
+        return "insuffecient_data"
+    return ["research", "market_trends"]   
+
+def insuffecient_data(state):
+    reasoning = "[Observation]No Competitors or Content found"
+    return {
+        "reasoning": reasoning,
+        "final_report" : None
+    }   
 def research_node(state):
+    
     competitors = state.competitors
-    reasoning = "[Action]Researching competitors and reviewing customer reviews"
-    data =[]
-    rev = []
-    for c in competitors :
-        #customer reviews
-        reasoning += f"[Action] Checking customer reviews for {c}\n"
+    thread_reasoning = "[Action] Initiating parallel competitor research pipeline..."
+    logs = {}
+
+    def run_parallel(c):
+        thread_reasoning = f"[Action] Checking customer reviews for {c}..."
         query = f"{c} customer reviews pros cons complaints"
-        scraped_data = page_scraping(web_search(query))
-        truncated_text = "\n".join(scraped_data)[:3000]
-        #while light_model.get_num_tokens(truncated_text) > 8000 :
-           # truncated_text = truncated_text[:-500]
-        reviews = sentiment_analyser(truncated_text)
-        rev.append(reviews)
-        reasoning += "[Observation]Customer reviews checked"
-        #competitors research
-        reasoning += "[Action]Researching competitors"
-        scraped = "\n".join(page_scraping(web_search(f"{c} pricing news strengths weaknesses 2024 2025")))[:1500]
-        #while light_model.get_num_tokens(scraped) > 8000 :
-            #scraped = scraped[:-500]
-        data.append(scraped)
-        reasoning += "[Observation]Competitors researched successfully"
-        time.sleep(5)
+        scraped_data , _ = page_scraping(web_search(query))
+        truncated_text = "\n".join(scraped_data)
         
-    reasoning += "[Action]Checking prices/ strengh and weakness of competitors"
-
-    #combined_data = str(data)
-    #while light_model.get_num_tokens(combined_data) > 9000:
-        # Drop the last 500 chars from the string representation
-        #combined_data = combined_data[:-500]
-
-    prompt = f"""You are a senior market intelligence analyst.
-Analyze the scraped data below for each competitor.
+        reviews = sentiment_analyser(truncated_text)
+        thread_reasoning += f"[Observation] Customer reviews checked for {c}."
+        thread_reasoning += f"[Action] Researching competitor positioning for {c}..."
+        scraped, _ = page_scraping(web_search(f"{c} pricing news strengths weaknesses 2024 2025"))
+        scraped_content = "\n".join(scraped)
+        thread_reasoning += f"[Observation] Competitor web data retrieved for {c}."
+        time.sleep(1) 
+        
+        prompt = f"""You are a senior market intelligence analyst.
+Analyze the scraped data provided at the end of this prompt.
 If data is limited, make reasonable inferences.
 
 CRITICAL LOGIC & FILTERING RULES:
 - If any metric or field (such as pricing/prices, strengths, weaknesses, or news) is missing or cannot be verified from the data, do NOT use placeholder values like "Unknown", "Not available", "None identified", "N/A", or "No data".
 - Instead, leave that list completely empty (e.g. `[]`) or omit the key entirely.
 
-Data:
-{data}
-
-CRITICAL: Return ONLY valid JSON. No notes, no explanation, no text outside the JSON brackets.
-
+CRITICAL: Return ONLY valid JSON. No notes, no explanation, no text outside the JSON brackets, matching this schema:
 {{
     "competitors_data": [
         {{
-            "name": "competitor name",
+            "name": "STRING_PLACEHOLDER",
             "news": ["news point"],
             "prices": ["pricing info"],
             "strengths": ["strength"],
             "weaknesses": ["weakness"]
         }}
     ]
-}}"""
-    output= light_model.invoke(prompt).content
-    cleaned = output.replace("```json","").replace("```","").strip() 
-    if not cleaned or not cleaned.startswith("{"):
-        print(f"LLM failed to return JSON. Raw output was: {output}")
-        parsed = {"competitors_data": [{"name": c, "news": [], "prices": [], "strengths": [], "weaknesses": []} for c in competitors]}
-    else:
-        try :
-            parsed = json.loads(cleaned)
-        except json.JSONDecodeError:
-            print(f"Failed to parse JSON. Cleaned string was: {cleaned}")
-            parsed = {"competitors_data": []}
-                
+}}
+
+====================
+[DYNAMIC INPUT DATA]
+Competitor Name: {c}
+Scraped Data & Reviews:
+{scraped_content[:4000]} + {reviews}
+"""
+        output = light_model.invoke(prompt).content
+        cleaned = output.replace("```json", "").replace("```", "").strip()
+        parsed = {"competitors_data": []}
+        if cleaned and cleaned.startswith("{"):
+            try:
+                parsed = json.loads(cleaned)
+            except json.JSONDecodeError:
+                print(f" JSON parsing failed on competitor {c}. Cleaned string was: {cleaned}")
+                parsed = {"competitors_data": [{"name": c, "news": [], "prices": [], "strengths": [], "weaknesses": []}]}
+        else:
+            parsed = {"competitors_data": [{"name": c, "news": [], "prices": [], "strengths": [], "weaknesses": []}]}
+
+        logs[c] = thread_reasoning
+        
+        return {"parsed": parsed, "reviews": reviews, "competitor": c}
+
+    all_competitors_data = []
+    all_sentiments = [] 
+
+    if not competitors:
+        thread_reasoning += "[Observation] No competitors identified to analyze."
+        return {
+            "competitors_data": [],
+            "sentiment": [],
+            "reasoning": thread_reasoning
+        }
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(competitors)) as executor:
+        future_to_competitor = {executor.submit(run_parallel, c): c for c in competitors}
+        for future in concurrent.futures.as_completed(future_to_competitor):
+            c = future_to_competitor[future]
+            try:
+                result = future.result()
+                all_competitors_data.extend(result["parsed"].get("competitors_data", []))
+                all_sentiments.append(result["reviews"])
+                thread_reasoning += logs.get(c, "")
+            except Exception as exc:
+                thread_reasoning += f"[Warning] Execution thread for {c} crashed: {exc}"
+                all_competitors_data.append({"name": c, "news": [], "prices": [], "strengths": [], "weaknesses": []})
+
+    thread_reasoning += "[Observation] Concurrent competitor research pipeline executed successfully."
+    
     return {
-        "competitors_data": parsed.get('competitors_data', []),
-        "sentiment": rev,
-        "reasoning": reasoning
+        "competitors_data": all_competitors_data,
+        "sentiment": all_sentiments,
+        "reasoning": thread_reasoning
     }
 
 def market_trends_node(state) : 
     reasoning = "[Action]Researching market trends"
     query = f"market trends about {state.query}"
-    scraped_list = page_scraping(web_search(query))
-    trends = "\n".join(scraped_list)[:2000]
+    scraped_list , _ = page_scraping(web_search(query))
+    trends = "\n".join(scraped_list)[:5000]
     prompt = f"""You are a senior market intelligence analyst.
     Based on the following market research data:
     {trends}
@@ -113,7 +156,10 @@ def market_trends_node(state) :
 
     inference = light_model.invoke(prompt).content
     cleaned_inference = inference.replace("```json", "").replace("```", "").strip()
-    parsed = json.loads(cleaned_inference)
+    try :
+        parsed = json.loads(cleaned_inference)
+    except json.JSONDecodeError :
+        parsed = {"market_trends": {}}
     reasoning += "[Observation]Market trends researched successfully"
     return {
         "market_trends": parsed.get('market_trends', {}),
@@ -125,73 +171,90 @@ def synthesize(state):
     judge_prompt = ""
     if state.llm_feedback:
         judge_prompt = f"""
-⚠️ PREVIOUS REPORT WAS REJECTED — YOU MUST FIX THESE SPECIFIC ISSUES:
+ PREVIOUS REPORT WAS REJECTED — YOU MUST FIX THESE SPECIFIC ISSUES:
 {state.llm_feedback}
 Explicitly address each point above in this new report before anything else."""
 
-    
-   # Drop this directly into your synthesis node file (e.g., nodes.py, prompts.py, or graph.py)
-
-    prompt = f"""You are a Lead Systems Architect, Principal Product Engineer, and Quantitative Business Strategist. 
+    prompt = f"""You are a Lead Systems Architect, Principal Product Engineer, and Quantitative Business Strategist.
 Your task is to synthesize a deeply technical, hyper-realistic Market Intelligence Report based on the provided user query and the retrieved web research context.
 
 {judge_prompt}
 
 TARGET AUDIENCE ANCHORS (Write exclusively for these profiles):
-- PRODUCT MANAGERS & BUILDERS: They demand technical constraints, explicit feature gaps, architectural challenges, and niche software tool integrations.
-- BUSINESS ANALYSTS & CONSULTANTS: They demand hard metrics, business model realities, unit economics, and structural market gaps.
-- STARTUP OWNERS & OPERATORS: They demand actionable, low-fluff operational steps, specific monetization mechanics, and pricing models.
+
+PRODUCT MANAGERS & BUILDERS: They demand technical constraints, explicit feature gaps, architectural challenges, and niche software tool integrations.
+
+BUSINESS ANALYSTS & CONSULTANTS: They demand hard metrics, business model realities, unit economics, and structural market gaps.
+
+STARTUP OWNERS & OPERATORS: They demand actionable, low-fluff operational steps, specific monetization mechanics, and pricing models.
 
 ══════════════════════════════════════════════════════════════════════════
-⚠️ CRITICAL ANTI-FLUFF GUARDRAIL (THE DEEP REASONING PROTOCOL):
+CRITICAL ANTI-FLUFF & ANTI-GENERIC PROTOCOL:
 You are strictly forbidden from giving generic, high-level business advice or using empty, passive verbs. Every recommendation, observation, and analysis must be translated into an engineering or operational blueprint.
+
+ THE FORBIDDEN WORD LIST (NEVER USE):
+
+"Robust", "Scalable", "Leverage", "Focus", "Optimize", "Strategic", "Synergy", "Partner", "Data-driven", "Robust", "Comprehensive", "Seamless", "Best-in-class", "Customer-centric", "Dynamic".
+
+ THE "TOOL-MANDATORY" CONSTRAINT:
+
+Every recommendation must name specific technology, frameworks, APIs, or regulatory standards. If you find yourself wanting to write a generic sentence, delete it. It is better to have a shorter report with 100% technical density than a longer report with fluff.
+
+ THE "EMPTY ADMISSION" PROTOCOL:
+
+If the research context does not provide enough data to form a specific technical recommendation, you are forbidden from guessing. You must explicitly state: "Insufficient technical data available to formulate a specific recommendation for this section."
 
 Study this Translation Matrix to understand the required depth and style. Note how the examples are framed around a mock Maritime IoT platform in Rotterdam—you must replicate this EXACT level of depth for whatever topic the user actually queried:
 
-❌ SURFACE-LEVEL FLUFF (ABSOLUTELY FORBIDDEN):
-- "Develop a robust AI-powered solution."
-- "Explore government funding opportunities."
-- "Implement a data-driven approach using analytics."
-- "Leverage cloud services to manage scaling."
-- "Focus on customer retention and onboarding."
+SURFACE-LEVEL FLUFF (ABSOLUTELY FORBIDDEN):
 
-✔️ DEEP TECHNICAL SPEC (MANDATORY WRITING STYLE - APPLIED TO CLIENT TOPIC):
-- "Deploy a localized, quantized Llama-3-8B model hosted on a self-hosted vLLM engine, bypassing API billing limitations by leveraging local bare-metal GPU leases."
-- "Establish a physical entity under regional customs frameworks (e.g., the Maritime Trade Act) to secure local corporate tax relief, state-backed logistics grants, and foreign currency capital clearances."
-- "Deploy an asynchronous event queue using Redis and Celery inside FastAPI middleware to track real-time payload delivery metrics and isolate user drop-off points."
-- "Implement a TimescaleDB hypertable partition scheme to index high-throughput GPS telemetry data streams, cutting database query latency for geographic bounding boxes by 42%."
-- "Build a conditional onboarding flow using telemetry hooks in React that dynamically triggers hands-on tutorials if a database connection string is not verified within 180 seconds."
+"Develop a robust AI-powered solution."
+
+"Explore government funding opportunities."
+
+"Implement a data-driven approach using analytics."
+
+"Leverage cloud services to manage scaling."
+
+"Focus on customer retention and onboarding."
+
+DEEP TECHNICAL SPEC (MANDATORY WRITING STYLE - APPLIED TO CLIENT TOPIC):
+
+"Deploy a localized, quantized Llama-3-8B model hosted on a self-hosted vLLM engine, bypassing API billing limitations by leveraging local bare-metal GPU leases."
+
+"Establish a physical entity under regional customs frameworks (e.g., the Maritime Trade Act) to secure local corporate tax relief, state-backed logistics grants, and foreign currency capital clearances."
+
+"Deploy an asynchronous event queue using Redis and Celery inside FastAPI middleware to track real-time payload delivery metrics and isolate user drop-off points."
+
+"Implement a TimescaleDB hypertable partition scheme to index high-throughput GPS telemetry data streams, cutting database query latency for geographic bounding boxes by 42%."
+
+"Build a conditional onboarding flow using telemetry hooks in React that dynamically triggers hands-on tutorials if a database connection string is not verified within 180 seconds."
 ══════════════════════════════════════════════════════════════════════════
 
-⚠️ ANTI-PARROT GUARDRAIL:
-Do NOT copy, reference, or use the literal concepts or phrasing from the "DEEP TECHNICAL SPEC" examples above (such as "vLLM", "Llama-3-8B", "Maritime Trade Act", "TimescaleDB", "FastAPI middleware", "Celery", or "Zustand") unless they are directly, explicitly mentioned in the retrieved research context below. 
-
-You must translate the *style, precision, and architectural depth* of these examples to the actual, retrieved realities of the user's specific query.
+ANTI-PARROT GUARDRAIL:
+Do NOT copy, reference, or use the literal concepts or phrasing from the "DEEP TECHNICAL SPEC" examples above (such as "vLLM", "Llama-3-8B", "Maritime Trade Act", "TimescaleDB", "FastAPI middleware", "Celery", or "Zustand") unless they are directly, explicitly mentioned in the retrieved research context below.
 
 CRITICAL LOGIC & FILTERING RULES:
 
-1. STRICT RELEVANCY FILTERING (Anti-Noise):
-   Evaluate all retrieved web context carefully. If a piece of information, company, or news article does not directly align with the specific geographic location, industry vertical, or core intent specified in the user query, discard it entirely. Do NOT include irrelevant global entities just because they share a keyword match.
+STRICT RELEVANCY FILTERING (Anti-Noise):
+Evaluate all retrieved web context carefully. If a piece of information, company, or news article does not directly align with the specific geographic location, industry vertical, or core intent specified in the user query, discard it entirely.
 
-   ⚠️ CRITICAL: Absolutely DO NOT include massive global tech monopolies (such as Google, Amazon, Microsoft, Apple, Meta/Facebook) as competitors or landscape alternatives unless the user explicitly named them in their query, or they are direct, literal, feature-for-feature competitors to the specific startup product mentioned. If your context only contains these generic tech giants, discard them completely and state that no direct startup alternatives were identified.
+CRITICAL: Absolutely DO NOT include massive global tech monopolies (such as Google, Amazon, Microsoft, Apple, Meta/Facebook) as competitors or landscape alternatives unless the user explicitly named them in their query. If your context only contains these generic tech giants, discard them completely and state that no direct startup alternatives were identified.
 
-2. DYNAMIC BULLET GENERATION (The "Unknown" Fix):
-   When profiling competitors, alternatives, or market metrics, only generate a section or bullet point if you have discovered explicit, verified facts in the context. If data regarding a metric (such as pricing, weaknesses, or customer sentiment) is missing, do NOT print placeholders like "Unknown", "N/A", or "Not available". Instead, completely omit that metric or bullet point from the output.
+DYNAMIC BULLET GENERATION (The "Unknown" Fix):
+Only generate a section or bullet point if you have discovered explicit, verified facts. If data regarding a metric is missing, do NOT print placeholders like "Unknown", "N/A", or "Not available". Instead, completely omit that metric or bullet point.
 
-3. NO STRAY DOTS OR PLACEHOLDERS:
-   Do NOT output stray periods, dots, or placeholder characters (such as "." or "N/A") on their own line between sections, list items, or anywhere in the report. Keep the formatting clean and continuous.
+NO STRAY DOTS OR PLACEHOLDERS:
+Do NOT output stray periods, dots, or placeholder characters on their own line between sections. Keep the formatting clean.
 
-4. SEMANTIC INTENT ALIGNMENT (Anti-Drift Guardrail):
-   Analyze the client's query to isolate the core operational or technical "subject" (e.g., if the query asks about "integrations", focus strictly on technical stacks, APIs, and software pipelines. If it asks about "marketing channels", focus strictly on user acquisition methods).
-   Discard broad, generic business observations that do not directly analyze this targeted operational subject. Every insight, trend, and recommendation must be anchored to this core subject.
+SEMANTIC INTENT ALIGNMENT (Anti-Drift):
+Analyze the client's query to isolate the core operational or technical "subject". Discard broad, generic business observations that do not directly analyze this targeted subject.
 
-5. MODERN HASH HEADERS ONLY (Anti-Line Formatting Guardrail):
-   ⚠️ CRITICAL FORMATTING RULE: Do NOT use old-school underlined headers (where text is followed by a line of `======` or `------` on the next line). You must exclusively use standard hash symbols (`#` for main title, `##` for main sections, `###` for sub-sections) to style your titles and sections. 
+MODERN HASH HEADERS ONLY:
+CRITICAL FORMATTING RULE: Do NOT use old-school underlined headers. You must exclusively use standard hash symbols (# for main title, ## for main sections, ### for sub-sections) to style your titles.
 
-6. THE FOUNDER/OPERATOR PERSPECTIVE:
-   The target reader of this report is a STARTUP FOUNDER/OPERATOR, not an investor. 
-   Do not write about "underwriting," "investment caution," or "due diligence." 
-   Translate all market data into actionable operational directives for a team building and selling software.
+THE FOUNDER/OPERATOR PERSPECTIVE:
+Translate all market data into actionable operational directives for a team building and selling software.
 
 ═══════════════════════════════════════
 CLIENT QUERY: {state.query}
@@ -203,61 +266,54 @@ COMPETITOR DETAILS & SENTIMENT:
 ═══════════════════════════════════════
 MARKET TRENDS & OVERVIEW:
 {state.market_trends}
+
+REFERENCES:
+{state.source}
 ═══════════════════════════════════════
 
 Now write a professional markdown report with EXACTLY this structure:
 
-# Market Research Report
+Market Research Report
 
-## Client Query
+Client Query
 
-State the user's original query clearly to establish context.
+State the user's original query clearly.
 
-## Executive Summary
+Executive Summary
 
-A concise overview of the market viability, major findings, and high-level conclusions. This must summarize the findings specifically through the lens of the client's core query intent, emphasizing technical and operational realities over generic startup optimism.
+Concise overview of market viability and technical realities through the lens of the client's core intent. No business optimism.
 
-## Competitor / Alternative Landscape
+Competitor / Alternative Landscape
 
-Profile the relevant entities found.
+Profile relevant entities. Omit missing attributes entirely. If no niche competitors exist, state: "No direct niche startup alternatives were identified in the research data."
 
-* REMINDER: Exclude Big Tech giants (Google, Amazon, etc.) unless they are direct, specific niche product matches.
+Market Trends & Opportunities
 
-* For each entity, only list the attributes (e.g., Positioning, Strengths, Weaknesses, Pricing, Recent News, Customer Sentiment) where explicit data exists. Omit any missing fields entirely.
+Bullet points detailing key technical shifts, ecosystem dynamics, or growth vectors. Every bullet must relate back to the core technical subject of the Client Query.
 
-* If no direct niche competitors were identified, state: "No direct niche startup alternatives were identified in the research data."
+Market Gaps & Challenges
 
-## Market Trends & Opportunities
+Highlight actual gaps, technical friction points, or business risks identified in the research context. If no specific technical gaps found, state: "Insufficient technical data available."
 
-Bullet points detailing key trends, ecosystem dynamics, or growth vectors supported by the context. Every bullet point must directly relate back to the core technical or operational subject of the Client Query. Focus on integration patterns, tech stack migrations, and customer behavioral shifts.
+Strategic Recommendations
 
-## Market Gaps & Challenges
+Provide exactly 3 concrete, actionable recommendations:
 
-Highlight actual gaps, technical friction points, or business risks identified in the research context. Avoid generic market risks; list specific, grounded technical, structural, or pricing blockers.
+[Task Name]
 
-## Strategic Recommendations
+Operational Action: [Actionable step. Start with a verb: Deploy, Configure, Index, Rewrite, Patch.]
 
-Provide actionable, numbered recommendations (minimum 3 concrete, actionable recommendations) tailored directly to answering the user's query based on the findings.
+Required Stack: [Name specific tools/libs/frameworks.]
 
-* Each recommendation must be structured with three distinct sub-components:
-  1. **Operational/Technical Action:** A concrete, highly descriptive task outlining *what* to build or execute (no generic verbs like "leverage" or "use" without specific, named technical tooling, SDKs, APIs, or regulatory frameworks).
-  2. **Stack & Tooling Blueprint:** Recommend specific tools, libraries, architectural configurations (e.g., PostgreSQL schema design, custom proxy servers, Stripe Billing API, local hosting, regional startup portals) and explain exactly how they integrate.
-  3. **Justification & Gap Alignment:** Justify how this recommendation solves a specific friction point, technical gap, or local constraint identified in the "Market Gaps & Challenges" section of this report.
+Technical Justification: [Why this specific tool solves the friction point identified in the report.]
 
-* Strictly avoid generic business advice or high-level strategic platitudes.
-
-Report generated by Market Research Agent"""
+Report generated by Market Research Agent""" 
     report = heavy_model.invoke(prompt).content
     
-    # Remove stray dots and formatting artifacts (e.g., ".\n2 .\n")
-    import re
-    cleaned_report = re.sub(r'\n\s*\.\s*\n', '\n', report)
-    cleaned_report = re.sub(r'\\n\s*\.\s*(?=\d+\s*\.)', '\\n', cleaned_report)
-    cleaned_report = cleaned_report.replace('\\n', '\n')
     
     reasoning += "[Observation]Report synthesized successfully"
     return {
-        "final_report": cleaned_report,
+        "final_report": report,
         "reasoning": reasoning
     }
 
@@ -291,6 +347,8 @@ Return ONLY valid JSON. No markdown, no explanation."""
                 "llm_feedback": content["missing"],
                 "retry_count": state.retry_count + 1,
             }
+        elif content["verdict"] == "fail" :
+            return {"llm_feedback" : [],"final_report" :None}
         else:
             return {"llm_feedback": []}
 

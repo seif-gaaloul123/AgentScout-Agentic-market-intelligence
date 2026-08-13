@@ -1,31 +1,109 @@
 from tavily import TavilyClient
-from langchain_groq import ChatGroq
 import os
 import json
 from dotenv import load_dotenv
 from scrapling.fetchers import Fetcher
-from groq import RateLimitError
-from langchain_google_genai import ChatGoogleGenerativeAI
-
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import BaseMessage, AIMessage, HumanMessage, SystemMessage
+from langchain_core.outputs import ChatResult, ChatGeneration
+import requests
 
 
 load_dotenv()
 
-light_model = ChatGroq(
-    model="llama-3.1-8b-instant", 
-    temperature=0)
+class CloudflareRotateChatModel(BaseChatModel):
+    model_name: str
+    api_tokens: list[str]
+    account_id: str = "9a70bd7cd464a835a234228aaf806b52"
+    _current_token_index: int = 0
 
-primary_model = ChatGroq(
-    model="meta-llama/llama-4-scout-17b-16e-instruct", 
-    temperature=0)
+    def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None, **kwargs) -> ChatResult:
+        formatted_messages = []
+        for msg in messages:
+            if isinstance(msg, SystemMessage):
+                role = "system"
+            elif isinstance(msg, HumanMessage):
+                role = "user"
+            else:
+                role = "assistant"
+            formatted_messages.append({"role": role, "content": msg.content})
 
-fallback_1 = ChatGroq(
-    model="llama-3.3-70b-versatile",
-    temperature=0)
+        payload = {"messages": formatted_messages}
+        
+        attempts = len(self.api_tokens)
+        last_error = None
 
-heavy_model = primary_model.with_fallbacks(
-    fallbacks=[fallback_1],
-    exceptions_to_handle=(RateLimitError,))
+        for _ in range(attempts):
+            token = self.api_tokens[self._current_token_index]
+            print(f"CURRENT TOKEN BEING TRIED (Index {self._current_token_index}): {token}")
+            headers = {"Authorization": f"Bearer {token}"}
+            url = f"https://api.cloudflare.com/client/v4/accounts/{self.account_id}/ai/run/{self.model_name}"
+
+            try:
+                response = requests.post(url, headers=headers, json=payload)
+                
+                if response.status_code in [429, 403]:
+                    print(f"Rate limit hit on token index {self._current_token_index}. Rotating key...")
+                    self._current_token_index = (self._current_token_index + 1) % len(self.api_tokens)
+                    continue
+                
+                response.raise_for_status()
+                res_json = response.json()
+                
+                content = res_json.get("result", {}).get("response", "")
+                
+                message = AIMessage(content=content)
+                generation = ChatGeneration(message=message)
+                return ChatResult(generations=[generation])
+
+            except Exception as e:
+                last_error = e
+                self._current_token_index = (self._current_token_index + 1) % len(self.api_tokens)
+
+        raise RuntimeError(f"All Cloudflare API tokens exhausted or request failed. Last error: {last_error}")
+
+    @property
+    def _llm_type(self) -> str:
+        return "cloudflare-rotate"
+
+raw_tokens = os.getenv("CLOUDFLARE_API_TOKENS", "")
+api_tokens_list = [t.strip() for t in raw_tokens.split(",") if t.strip()]
+print("PARSED TOKENS LIST:", api_tokens_list)
+
+if api_tokens_list:
+    heavy_model = CloudflareRotateChatModel(
+        model_name="@cf/google/gemma-4-26b-a4b-it",
+        api_tokens=api_tokens_list
+    )
+    light_model = CloudflareRotateChatModel(
+        model_name="@cf/meta/llama-3.1-8b-instruct-fp8",
+        api_tokens=api_tokens_list
+    )
+else:
+    raise ValueError("No LLM API tokens (GROQ_API_KEY or CLOUDFLARE_API_TOKENS) found in environment.")
+
+
+def better_query(query:str):
+    prompt = f"""You are an expert search query strategist and research assistant. 
+Your goal is to transform a user's brief, high-level search phrase into a deep, highly specific research question optimized for web search engines and LLM-driven analysis agents.
+
+Instructions:
+1. **Expand Context**: Identify the underlying business, economic, or technical intent behind the query.
+2. **Add Dimensions**: Explicitly hint at core metrics, competitive dynamics, market implications, or regional nuances (if a location is implied or contextually relevant).
+3. **Remove Ambiguity**: Turn vague keywords into a structured, explicit question.
+4. **Constraint**: Output **ONLY** the rewritten research question. Do not include conversational filler, preamble, introductory remarks, or quotation marks.
+
+Examples:
+- User: "coffee shop delivery"
+  Rewrite: "Should I add a delivery service to an existing coffee shop business in Tunisia? What are the local competitive dynamics, operational margin implications, and logistics challenges?"
+
+- User: "best python backend framework 2026"
+  Rewrite: "What are the top-performing Python backend frameworks in 2026, comparing FastAPI, Django, and modern asynchronous alternatives in terms of performance, async support, and ecosystem maturity?"
+
+User Query: "{query}"
+"""
+    new_query = light_model.invoke(prompt).content
+    return new_query
 
 def web_search(query:str,max_results:int=3):
     try:
@@ -43,22 +121,26 @@ def web_search(query:str,max_results:int=3):
    
 def page_scraping(results):
     page_content =[]
+    content_count = 0
     for i in results:
         try : 
             page = Fetcher.get(i['url'])
             text =page.get_all_text(strip=True,ignore_tags=('script','style','footer','nav'))
             page_content.append(text)
+            content_count += 1
         except Exception as e :
             print(f"Failed to fetch {i['url']}")
             page_content.append("")
-    return page_content
+    scraped_ratio = content_count/len(results) if results else 0       
+    return page_content , scraped_ratio
 
 def sentiment_analyser(page_content):
-    prompt = f"""Analyze reviews about "{page_content}". Return JSON only:
+    truncated = page_content[:6000] if isinstance(page_content, str) else str(page_content)[:6000]
+    prompt = f"""Analyze reviews about "{truncated}". Return JSON only:
 {{"positive": [...], "negative": [...], "overall_sentiment": "positive|negative|mixed", "summary": "..."}}
-Reviews: {page_content}"""
+Reviews: {truncated}"""
     if not page_content:
-        return {{"positive": [], "negative": [], "summary": "No data available"}}
+        return {"positive": [], "negative": [], "summary": "No data available"}
     else:
         output = light_model.invoke(prompt).content
         cleaned = output.replace("```json", "").replace("```", "").strip()
