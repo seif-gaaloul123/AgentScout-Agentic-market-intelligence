@@ -11,11 +11,36 @@ import requests
 
 load_dotenv()
 
+
+def load_cloudflare_credentials(path: str | None = None) -> list[tuple[str, str]]:
+    """Parse keys.txt into (account_id, api_key) pairs.
+
+    Layout per block:
+        <account_id>
+        <api_key>
+        --
+
+    The '--' line is an optional separator between blocks.
+    """
+    if path is None:
+        path = os.path.join(os.path.dirname(__file__), "keys.txt")
+
+    with open(path) as f:
+        blocks = [b.strip() for b in f.read().split("--") if b.strip()]
+
+    credentials: list[tuple[str, str]] = []
+    for block in blocks:
+        lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+        if len(lines) >= 2:
+            credentials.append((lines[0], lines[1]))
+
+    return credentials
+
+
 class CloudflareRotateChatModel(BaseChatModel):
     model_name: str
-    api_tokens: list[str]
-    account_id: str = "9a70bd7cd464a835a234228aaf806b52"
-    _current_token_index: int = 0
+    credentials: list[tuple[str, str]]
+    _current_index: int = 0
 
     def _generate(self, messages: list[BaseMessage], stop: list[str] | None = None, **kwargs) -> ChatResult:
         formatted_messages = []
@@ -29,58 +54,58 @@ class CloudflareRotateChatModel(BaseChatModel):
             formatted_messages.append({"role": role, "content": msg.content})
 
         payload = {"messages": formatted_messages}
-        
-        attempts = len(self.api_tokens)
+
+        attempts = len(self.credentials)
         last_error = None
 
         for _ in range(attempts):
-            token = self.api_tokens[self._current_token_index]
-            print(f"CURRENT TOKEN BEING TRIED (Index {self._current_token_index}): {token}")
+            account_id, token = self.credentials[self._current_index]
+            print(f"CURRENT CREDENTIAL BEING TRIED (Index {self._current_index}) account={account_id}")
             headers = {"Authorization": f"Bearer {token}"}
-            url = f"https://api.cloudflare.com/client/v4/accounts/{self.account_id}/ai/run/{self.model_name}"
+            url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/{self.model_name}"
 
             try:
                 response = requests.post(url, headers=headers, json=payload)
-                
+
                 if response.status_code in [429, 403]:
-                    print(f"Rate limit hit on token index {self._current_token_index}. Rotating key...")
-                    self._current_token_index = (self._current_token_index + 1) % len(self.api_tokens)
+                    print(f"Rate limit hit on credential index {self._current_index}. Rotating account + key...")
+                    self._current_index = (self._current_index + 1) % len(self.credentials)
                     continue
-                
+
                 response.raise_for_status()
                 res_json = response.json()
-                
+
                 content = res_json.get("result", {}).get("response", "")
-                
+
                 message = AIMessage(content=content)
                 generation = ChatGeneration(message=message)
                 return ChatResult(generations=[generation])
 
             except Exception as e:
                 last_error = e
-                self._current_token_index = (self._current_token_index + 1) % len(self.api_tokens)
+                self._current_index = (self._current_index + 1) % len(self.credentials)
 
-        raise RuntimeError(f"All Cloudflare API tokens exhausted or request failed. Last error: {last_error}")
+        raise RuntimeError(f"All Cloudflare credentials exhausted or request failed. Last error: {last_error}")
 
     @property
     def _llm_type(self) -> str:
         return "cloudflare-rotate"
 
-raw_tokens = os.getenv("CLOUDFLARE_API_TOKENS", "")
-api_tokens_list = [t.strip() for t in raw_tokens.split(",") if t.strip()]
-print("PARSED TOKENS LIST:", api_tokens_list)
 
-if api_tokens_list:
+credentials = load_cloudflare_credentials()
+print(f"PARSED CREDENTIALS COUNT: {len(credentials)}")
+
+if credentials:
     heavy_model = CloudflareRotateChatModel(
         model_name="@cf/google/gemma-4-26b-a4b-it",
-        api_tokens=api_tokens_list
+        credentials=credentials
     )
     light_model = CloudflareRotateChatModel(
         model_name="@cf/meta/llama-3.1-8b-instruct-fp8",
-        api_tokens=api_tokens_list
+        credentials=credentials
     )
 else:
-    raise ValueError("No LLM API tokens (GROQ_API_KEY or CLOUDFLARE_API_TOKENS) found in environment.")
+    raise ValueError("No Cloudflare credentials (account_id + api_key pairs) found in keys.txt")
 
 
 def better_query(query:str):
