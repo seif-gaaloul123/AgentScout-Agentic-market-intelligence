@@ -1,21 +1,25 @@
 from pydantic import BaseModel
-from typing import List, Optional, Any , Annotated
+from typing import List, Optional, Any, Annotated
 import operator
+
+def take_latest(existing, new):
+    return new
 
 class AgentState(BaseModel):
     query: str = ""
-    results: List[Any] = []
-    page_content: List[Any] = []
-    sentiment: List[Any] = []
-    competitors: List[Any] = []
+    results: Annotated[List[Any], take_latest] = []
+    page_content: Annotated[List[Any], take_latest] = []
+    sentiment: Annotated[List[Any], take_latest] = []
+    
+    # Use operator.add so parallel research and market trend nodes combine data safely
+    competitors: Annotated[List[Any], operator.add] = []
     reasoning: Annotated[str, operator.add] = ""
-    market_trends: Any = {}
-    competitors_data: List[Any] = []
+    market_trends: Annotated[Any, take_latest] = {}
+    competitors_data: Annotated[List[Any], operator.add] = []
+    
     final_report: Optional[str] = None
-    llm_feedback : List[str] = []
-    retry_count: int = 0
-    source : List[str] = []
-    has_data : bool = True
+    llm_feedback: Annotated[List[str], take_latest] = []
+    retry_count: int = 0  # Standard integer for explicit overwriting/incrementing
+    source: Annotated[List[str], take_latest] = []
+    has_data: bool = True
     scraped_ratio: float = 0.0
-
-

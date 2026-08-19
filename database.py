@@ -25,7 +25,7 @@ class BaseSearch(Base):
     __tablename__ = "base_searches"
     id = Column(String, primary_key=True, index=True)
     query = Column(String, index=True)
-    response = Column(Text, index=True)
+    response = Column(Text)
     status = Column(String , default = "queued")
 
 Base.metadata.create_all(bind=engine)    

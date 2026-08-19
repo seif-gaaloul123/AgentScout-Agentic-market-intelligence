@@ -9,6 +9,9 @@ import asyncio
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
+def join_node(state):
+    return {}
+
 async def agent(query:str,config: dict):
     db_url = os.getenv("DATABASE_URL")
     if os.path.exists("/.dockerenv") and db_url and "localhost" in db_url:
@@ -21,12 +24,13 @@ async def agent(query:str,config: dict):
         graph.add_node("market_trends",market_trends_node)
         graph.add_node("synthesize",synthesize)
         graph.add_node("quality_check",quality_check)
-        graph.add_node("insuffecient_data",insuffecient_data)        
+        graph.add_node("insuffecient_data",insuffecient_data)     
         graph.add_edge(START, "search")
-        graph.add_conditional_edges("search",data_check_router)
-        graph.add_edge("insuffecient_data",END)        
+        graph.add_conditional_edges("search",data_check_router,{"insuffecient_data": "insuffecient_data",
+        "sufficient_data": "research"})
+        graph.add_edge("insuffecient_data",END)
+        graph.add_edge("research", "market_trends")
         graph.add_edge("market_trends","synthesize")
-        graph.add_edge("research", "synthesize")
         graph.add_edge("synthesize","quality_check")
         graph.add_conditional_edges("quality_check", route_after_quality, {
         "retry": "synthesize",
@@ -39,7 +43,7 @@ async def agent(query:str,config: dict):
         "sentiment": [],
         "competitors": [],
         "reasoning": "",
-        "market_trends": [],
+        "market_trends": {},
         "competitors_data": [],
         "llm_feedback":[],
         "retry_count": 0,

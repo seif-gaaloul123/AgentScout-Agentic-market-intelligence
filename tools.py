@@ -74,8 +74,16 @@ class CloudflareRotateChatModel(BaseChatModel):
 
                 response.raise_for_status()
                 res_json = response.json()
+                print(f"RAW CLOUDFLARE RESPONSE FOR {self.model_name}: {res_json}")
 
-                content = res_json.get("result", {}).get("response", "")
+                result = res_json.get("result", {})
+
+                if "response" in result:
+                    content = result.get("response", "")
+                elif "choices" in result and result["choices"]:
+                    content = result["choices"][0].get("message", {}).get("content", "")
+                else:
+                    content = ""
 
                 message = AIMessage(content=content)
                 generation = ChatGeneration(message=message)
@@ -101,7 +109,7 @@ if credentials:
         credentials=credentials
     )
     light_model = CloudflareRotateChatModel(
-        model_name="@cf/meta/llama-3.1-8b-instruct-fp8",
+        model_name="@cf/google/gemma-4-26b-a4b-it",
         credentials=credentials
     )
 else:
@@ -116,11 +124,15 @@ Instructions:
 1. **Expand Context**: Identify the underlying business, economic, or technical intent behind the query.
 2. **Add Dimensions**: Explicitly hint at core metrics, competitive dynamics, market implications, or regional nuances (if a location is implied or contextually relevant).
 3. **Remove Ambiguity**: Turn vague keywords into a structured, explicit question.
-4. **Constraint**: Output **ONLY** the rewritten research question. Do not include conversational filler, preamble, introductory remarks, or quotation marks.
+4. **Competitor Focus**: The rewritten query MUST be formulated to surface SPECIFIC COMPANIES, PLATFORMS, TOOLS, or MARKET PLAYERS operating in this space. Frame it as a competitive landscape or market analysis question.
+5. **Constraint**: Output **ONLY** the rewritten research question. Do not include conversational filler, preamble, introductory remarks, or quotation marks.
 
 Examples:
 - User: "coffee shop delivery"
-  Rewrite: "Should I add a delivery service to an existing coffee shop business in Tunisia? What are the local competitive dynamics, operational margin implications, and logistics challenges?"
+  Rewrite: "Should I add a delivery service to an existing coffee shop business in Tunisia? What are the local competitive dynamics, operational margin implications, and logistics challenges of platforms like Glovo and Jumia Food?"
+
+- User: "strategies to scale and monetize an AI startup"
+  Rewrite: "What companies, platforms, and tools dominate the AI startup monetization landscape in 2024? Who are the key players in AI infrastructure, API monetization, and SaaS tooling for scaling AI products?"
 
 - User: "best python backend framework 2026"
   Rewrite: "What are the top-performing Python backend frameworks in 2026, comparing FastAPI, Django, and modern asynchronous alternatives in terms of performance, async support, and ecosystem maturity?"
@@ -130,7 +142,7 @@ User Query: "{query}"
     new_query = light_model.invoke(prompt).content
     return new_query
 
-def web_search(query:str,max_results:int=3):
+def web_search(query:str,max_results:int=5):
     try:
         client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
         response = client.search(

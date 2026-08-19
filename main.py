@@ -71,6 +71,8 @@ async def agent_response(query_text:str,id:str):
             db.commit()
         config = {"configurable": {"thread_id": id}} #for the checkpointer part
         response = await agent(query_text, config=config)
+        print(f"RESPONSE TYPE: {type(response)}")
+        print(f"RESPONSE VALUE: {repr(response)}")
         if response :
             clean_response = response.replace("\\n", "\n")
             search.response = clean_response
