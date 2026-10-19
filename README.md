@@ -151,6 +151,5 @@ curl http://localhost:8000/jobs/<job-uuid>
 Industrial Computer Engineering student, ENET'Com Sfax
 GitHub: [@seif-gaaloul123](https://github.com/seif-gaaloul123)
 
-## License
 
 Add a license (e.g. MIT) if you want others to reuse the code.
