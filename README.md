@@ -1,89 +1,69 @@
-﻿# AgentScout
+# AgentScout
 
-**Agentic market intelligence.** Give it a business idea or product, and it researches your competitors, pulls market trends, and returns a structured report, all in a few minutes.
+**Agentic market intelligence.** Describe a business idea or product, and AgentScout researches your competitors, pulls market trends, and returns a structured report in under 4 minutes.
 
-AgentScout is a multi-step LangGraph pipeline that combines web search, scraping, and an LLM-as-judge quality gate to produce reports you can actually trust (or it retries until they're good enough).
+## What it does
 
-## Features
+Give it a rough idea like *"AI-powered CRM for small businesses"*. AgentScout:
 
-- **Query rewriting**: turns a rough user input into focused search queries
-- **Parallel competitor research**: researches up to 5 competitors per run using Tavily (search) and Scrapling (scraping)
-- **Market trend research**: separate branch for industry news and trends
-- **Synthesis**: merges everything into one structured report
-- **LLM-as-judge quality gate**: scores the report with structured JSON evaluation and loops back to retry if quality is too low
-- **Async job system**: submit a job, get a UUID, poll for the result
-- **Full report in under 4 minutes** for a typical run
+1. Rewrites the input into focused search queries
+2. Researches up to **5 competitors in parallel** (Tavily for search, Scrapling for scraping)
+3. Runs a separate branch for **market trends and industry news**
+4. Synthesizes everything into one structured report
+5. Scores the report with an **LLM-as-judge** and automatically retries if quality is too low
 
-## Architecture
+The whole thing runs as an async job: you submit a request, get a job ID back immediately, and poll for the result.
 
-```
-User request
-     │
-     ▼
- FastAPI ──► TaskIQ (Redis queue) ──► Worker
-                                         │
-                                         ▼
-                                 LangGraph pipeline
-        ┌────────────────────────────────────────────────────┐
-        │  rewrite query                                     │
-        │       │                                            │
-        │       ├──► competitor research (Scrapling + Tavily)│
-        │       └──► market trends research                  │
-        │                    │                               │
-        │                    ▼                               │
-        │               synthesize                           │
-        │                    │                               │
-        │                    ▼                               │
-        │          LLM-as-judge quality gate ──(fail)──┐     │
-        │                    │                         │     │
-        │                 (pass)                  retry loop │
-        └────────────────────┼─────────────────────────┘─────┘
-                             ▼
-                  PostgreSQL (job state + checkpoints)
+## How it works
+
+```mermaid
+flowchart TD
+    U[User request] --> API[FastAPI]
+    API -->|enqueue job| Q[(Redis / TaskIQ)]
+    Q --> W[TaskIQ worker]
+    W --> R[Rewrite query]
+    R --> C[Competitor research<br/>Tavily + Scrapling]
+    R --> T[Market trends research]
+    C --> S[Synthesize report]
+    T --> S
+    S --> J{LLM-as-judge<br/>quality gate}
+    J -->|fail| R
+    J -->|pass| DB[(PostgreSQL<br/>job state + checkpoints)]
 ```
 
-The graph uses conditional edges for the retry loop, and state is checkpointed in PostgreSQL via `AsyncPostgresSaver`, so runs are resumable and inspectable.
+The pipeline is a LangGraph state graph with conditional edges for the retry loop. State is checkpointed in PostgreSQL with `AsyncPostgresSaver`, so runs are resumable and inspectable after a failure.
 
-## Tech Stack
+## Design decisions
+
+- **LLM-as-judge instead of trusting the first draft.** A judge node returns structured JSON scores. If the report falls below the threshold, the graph loops back and tries again.
+- **No RAG or vector store.** An earlier version used FAISS. I removed it: live search and scraping give fresher data, and the retrieval layer added complexity without improving the reports.
+- **Async job queue.** Runs take minutes, so the API returns a job UUID right away and a TaskIQ worker does the heavy lifting.
+- **Checkpointed state.** PostgreSQL checkpointing keeps graph state durable across retries and crashes.
+- **Observability from the start.** Runs are traced with LangSmith, which made debugging node-level failures much easier.
+
+## Tech stack
 
 | Layer | Tools |
-|---|---|
+| --- | --- |
 | Orchestration | LangGraph, LangChain |
 | LLM | Gemma via Cloudflare Workers AI |
-| Search & scraping | Tavily, Scrapling |
+| Search and scraping | Tavily, Scrapling |
 | API | FastAPI, SlowAPI (rate limiting) |
 | Task queue | TaskIQ + Redis |
 | Database | PostgreSQL, SQLAlchemy (async) |
 | Observability | LangSmith |
-| Deployment | Docker / Docker Compose |
-| Frontend | See `frontend/` |
+| Deployment | Docker, Docker Compose |
 
-## Project Structure
+## Getting started
 
-```
-AgentScout/
-├── backend/     # FastAPI app, LangGraph pipeline, TaskIQ worker
-├── frontend/    # Web UI
-└── README.md
-```
-
-## Getting Started
-
-### Prerequisites
-
-- Docker and Docker Compose
-- API keys for Tavily, Cloudflare Workers AI, and (optionally) LangSmith
-
-### 1. Clone the repo
+**Prerequisites:** Docker and Docker Compose, plus API keys for Tavily, your LLM provider, and (optionally) LangSmith.
 
 ```bash
-git clone https://github.com/seif-gaaloul123/AgentScout.git
-cd AgentScout
+git clone https://github.com/seif-gaaloul123/AgentScout-Agentic-market-intelligence.git
+cd AgentScout-Agentic-market-intelligence
 ```
 
-### 2. Configure environment variables
-
-Create a `.env` file in `backend/` (never commit it):
+Create `backend/.env` (never commit it):
 
 ```env
 # LLM
@@ -93,7 +73,7 @@ CLOUDFLARE_API_KEY=your_api_key
 # Search
 TAVILY_API_KEY=your_tavily_key
 
-# Database & queue
+# Database and queue
 DATABASE_URL=postgresql+asyncpg://user:password@postgres:5432/agentscout
 REDIS_URL=redis://redis:6379
 
@@ -102,17 +82,13 @@ LANGSMITH_API_KEY=your_langsmith_key
 LANGSMITH_TRACING=true
 ```
 
-> Adjust variable names to match your actual `.env` / config file.
-
-### 3. Run with Docker
+Start everything (API, worker, PostgreSQL, Redis):
 
 ```bash
 docker compose up --build
 ```
 
-This starts the API, the TaskIQ worker, PostgreSQL, and Redis.
-
-### 4. Try it
+## Usage
 
 ```bash
 # Submit a job
@@ -124,32 +100,35 @@ curl -X POST http://localhost:8000/jobs \
 curl http://localhost:8000/jobs/<job-uuid>
 ```
 
-> Adjust endpoints to match your actual routes. Interactive docs are available at `http://localhost:8000/docs`.
+Interactive API docs are available at `http://localhost:8000/docs`.
 
-## Design Decisions
+## Project structure
 
-- **No RAG / vector store.** An earlier version used FAISS. It was removed because live search and scraping give fresher data and the retrieval layer added complexity without improving reports.
-- **LLM-as-judge with retry loop.** Instead of trusting the first draft, a judge node scores the output and sends it back through the pipeline when it falls short.
-- **Async job queue.** Research runs take minutes, so the API returns a job UUID immediately and a TaskIQ worker does the heavy lifting.
-- **Checkpointed state.** PostgreSQL checkpointing keeps the graph state durable across retries and failures.
+```
+.
+├── backend/     # FastAPI app, LangGraph pipeline, TaskIQ worker
+├── frontend/    # Web UI
+└── README.md
+```
 
-## Known Limitations
+## Known limitations
 
-- Free/limited LLM tiers hit rate limits quickly; API key rotation is used to work around this.
-- Scraping depends on target sites' structure and anti-bot protections, so results vary.
+- Free-tier LLM plans hit rate limits quickly, so the project rotates API keys to work around them.
+- Scraping depends on each target site's structure and anti-bot protection, so results vary between runs.
 - Worker concurrency defaults to 2 concurrent jobs.
 
 ## Roadmap
 
 - [ ] Multi-provider LLM fallback
-- [ ] Export reports to PDF
+- [ ] Report export to PDF
 - [ ] Caching of competitor data between runs
 
 ## Author
 
-**Seif Gaaloul**
-Industrial Computer Engineering student, ENET'Com Sfax
-GitHub: [@seif-gaaloul123](https://github.com/seif-gaaloul123)
+**Seif Gaaloul**, Industrial Computer Engineering student at ENET'Com Sfax.
+[GitHub](https://github.com/seif-gaaloul123) · [LinkedIn](https://linkedin.com/in/seif-gaaloul)
 
+## License
 
-Add a license (e.g. MIT) if you want others to reuse the code.
+MIT. See [LICENSE](LICENSE).
+
